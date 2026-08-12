@@ -79,6 +79,56 @@ func monitorTimeouts() {
 	}
 }
 
+func apiPS(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.DB.Query("SELECT device_id, nickname, status, first_seen, last_seen, agent_version FROM devices")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var devices []map[string]string
+	for rows.Next() {
+		var id, name, status, first, last, ver string
+		rows.Scan(&id, &name, &status, &first, &last, &ver)
+		devices = append(devices, map[string]string{
+			"device_id": id, "nickname": name, "status": status,
+			"first_seen": first, "last_seen": last, "agent_version": ver,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(devices)
+}
+
+func apiRename(w http.ResponseWriter, r *http.Request) {
+	var req map[string]string
+	json.NewDecoder(r.Body).Decode(&req)
+
+	_, err := db.DB.Exec("UPDATE devices SET nickname = ? WHERE nickname = ?", req["new_name"], req["old_name"])
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func apiInspect(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	var id, nickname, status, first, last, ver string
+	err := db.DB.QueryRow("SELECT device_id, nickname, status, first_seen, last_seen, agent_version FROM devices WHERE nickname = ?", name).
+		Scan(&id, &nickname, &status, &first, &last, &ver)
+
+	if err != nil {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"device_id": id, "nickname": nickname, "status": status,
+		"first_seen": first, "last_seen": last, "agent_version": ver,
+	})
+}
 // --- ADMIN API Handlers for CLI ---
 // Implementation omitted for brevity, but they just run standard SELECT/UPDATE
 // queries on the SQLite DB and return JSON. E.g. UPDATE devices SET nickname=?
