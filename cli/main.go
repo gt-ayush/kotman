@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -26,7 +27,7 @@ type DeviceData struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: kotman <ps|rename|inspect>")
+		fmt.Println("Usage: kotman <ps|rename|inspect|exec>")
 		return
 	}
 
@@ -51,14 +52,12 @@ func main() {
 			fmt.Println("Usage: kotman exec <pc_name> <operation> [key=value ...]")
 			return
 		}
-		
+
 		args := make(map[string]string)
 		for _, arg := range os.Args[4:] {
-			// Basic parsing for args like task=update-dashboard
-			var key, val string
-			fmt.Sscanf(arg, "%[^=]=%s", &key, &val)
-			if key != "" {
-				args[key] = val
+			parts := strings.SplitN(arg, "=", 2)
+			if len(parts) == 2 {
+				args[parts[0]] = parts[1]
 			}
 		}
 		runExec(os.Args[2], os.Args[3], args)
