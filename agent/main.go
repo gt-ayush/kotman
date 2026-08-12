@@ -6,11 +6,15 @@ import (
 	"log"
 	"os"
 	"time"
+	"runtime"
+	"strconv"
+	"sync"
 
 	"kotman/protocol"
 	"github.com/gorilla/websocket"
 )
 
+var writeMutex sync.Mutex
 const ServerURL = "ws://localhost:8080/ws"
 
 func main() {
@@ -92,3 +96,68 @@ func getOrCreateDeviceID() string {
 	os.WriteFile(filename, []byte(newID), 0600)
 	return newID
 }
+
+func sendMsg(conn *websocket.Conn, msg protocol.Message) error {
+	writeMutex.Lock()
+	defer writeMutex.Unlock()
+	return conn.WriteJSON(msg)
+}
+
+// In connectAndRun(), update the read loop to dispatch commands:
+for {
+	var msg protocol.Message
+	err := conn.ReadJSON(&msg)
+	if err != nil { return err }
+
+	switch msg.Type {
+	case protocol.MsgAuthOK:
+		log.Println("Authenticated with VPS successfully.")
+	case protocol.MsgExec:
+		// Launch goroutine so long-running tasks don't block heartbeats
+		go func(req protocol.Message) {
+			res := executeOperation(req)
+			sendMsg(conn, res)
+		}(msg)
+	}
+}
+
+// The explicit authorization dispatcher
+func executeOperation(req protocol.Message) protocol.Message {
+	log.Printf("Executing operation: %s (%s)", req.Operation, req.RequestID)
+	
+	res := protocol.Message{
+		Type:      protocol.MsgExecResult,
+		RequestID: req.RequestID,
+		Success:   true,
+		Result:    make(map[string]string),
+	}
+
+	switch req.Operation {
+	case "status":
+		res.Result["status"] = "ONLINE"
+		res.Result["agent_version"] = "0.1.0"
+		
+	case "system-info":
+		res.Result["os"] = runtime.GOOS
+		res.Result["arch"] = runtime.GOARCH
+		res.Result["cpus"] = strconv.Itoa(runtime.NumCPU())
+		
+	case "run-task":
+		// Example named task simulation
+		taskName := req.Args["task"]
+		if taskName == "update-dashboard" {
+			time.Sleep(2 * time.Second) // Simulate work
+			res.Result["output"] = "Dashboard updated successfully."
+		} else {
+			res.Success = false
+			res.Error = "Unknown task: " + taskName
+		}
+		
+	default:
+		res.Success = false
+		res.Error = "operation not permitted"
+	}
+	return res
+}
+
+// Update heartbeats and HELLO to use sendMsg(conn, ...) instead of conn.WriteJSON
