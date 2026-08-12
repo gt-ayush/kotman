@@ -44,6 +44,22 @@ func main() {
 			return
 		}
 		runInspect(os.Args[2])
+	case "exec":
+		if len(os.Args) < 4 {
+			fmt.Println("Usage: kotman exec <pc_name> <operation> [key=value ...]")
+			return
+		}
+		
+		args := make(map[string]string)
+		for _, arg := range os.Args[4:] {
+			// Basic parsing for args like task=update-dashboard
+			var key, val string
+			fmt.Sscanf(arg, "%[^=]=%s", &key, &val)
+			if key != "" {
+				args[key] = val
+			}
+		}
+		runExec(os.Args[2], os.Args[3], args)
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
 	}
@@ -113,4 +129,35 @@ func runInspect(name string) {
 	fmt.Printf("Status:\t %s\n", d.Status)
 	fmt.Printf("Seen:\t %s\n", d.LastSeen)
 	fmt.Printf("Agent:\t %s\n", d.AgentVersion)
+}
+
+func runExec(target, operation string, args map[string]string) {
+	payload, _ := json.Marshal(map[string]any{
+		"target":    target,
+		"operation": operation,
+		"args":      args,
+	})
+
+	resp, err := http.Post(AdminURL+"/exec", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		fmt.Println("Network error:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusGatewayTimeout {
+		fmt.Println("Error: Operation timed out (device may have disconnected).")
+		return
+	}
+
+	var result protocol.Message
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	if result.Success {
+		for k, v := range result.Result {
+			fmt.Printf("%s:\t%s\n", k, v)
+		}
+	} else {
+		fmt.Printf("Operation Failed: %s\n", result.Error)
+	}
 }
