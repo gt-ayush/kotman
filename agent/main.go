@@ -3,80 +3,161 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log"
 	"os"
-	"time"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
+	"time"
 
 	"kotman/protocol"
+
 	"github.com/gorilla/websocket"
+	"github.com/kardianos/service"
 )
 
+// In a real deployment, you'd read this from config.json
+const serverURL = "ws://127.0.0.1:8080/ws"
+const agentVersion = "0.1.0"
+
 var writeMutex sync.Mutex
-const ServerURL = "ws://localhost:8080/ws"
+
+// program implements service.Interface
+type program struct {
+	exit chan struct{}
+}
 
 func main() {
-	deviceID := getOrCreateDeviceID()
-	log.Printf("Kotman Agent starting... Device ID: %s", deviceID)
+	svcConfig := &service.Config{
+		Name:        "KotmanAgent",
+		DisplayName: "Kotman Agent",
+		Description: "Background management agent for Kotman VPS",
+	}
 
-	// Infinite reconnect loop (satisfies Tests 4 & 5)
-	for {
-		err := connectAndRun(deviceID)
+	prg := &program{}
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Setup logger for the service (writes to Event Viewer on Windows, Syslog on Linux)
+	logger, err := s.Logger(nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Handle CLI commands (install, uninstall, start, stop)
+	if len(os.Args) > 1 {
+		err = service.Control(s, os.Args[1])
 		if err != nil {
-			log.Printf("Disconnected: %v. Retrying in 5 seconds...", err)
+			log.Fatalf("Valid actions: %q\n%v", service.ControlAction, err)
 		}
-		time.Sleep(5 * time.Second)
+		return
+	}
+
+	// Start the service
+	err = s.Run()
+	if err != nil {
+		logger.Error(err)
 	}
 }
 
-func connectAndRun(deviceID string) error {
-	log.Printf("Connecting to %s...", ServerURL)
-	conn, _, err := websocket.DefaultDialer.Dial(ServerURL, nil)
+func (p *program) Start(s service.Service) error {
+	p.exit = make(chan struct{})
+	
+	// Start the main agent loop in the background so Start() can return quickly
+	go p.run()
+	return nil
+}
+
+func (p *program) Stop(s service.Service) error {
+	// Signal the running goroutines to shut down gracefully
+	close(p.exit)
+	<-time.After(time.Second) // Give it a moment to clean up
+	return nil
+}
+
+func (p *program) run() {
+	deviceID := getDeviceID()
+	log.Printf("Starting Kotman Agent with Device ID: %s", deviceID)
+
+	// Reconnect Loop
+	for {
+		select {
+		case <-p.exit:
+			return
+		default:
+		}
+
+		err := p.connectToServer(deviceID)
+		if err != nil {
+			log.Printf("Disconnected: %v. Retrying in 5 seconds...", err)
+			
+			// Wait 5 seconds before retrying, but allow immediate exit if service is stopped
+			select {
+			case <-time.After(5 * time.Second):
+			case <-p.exit:
+				return
+			}
+		}
+	}
+}
+
+func (p *program) connectToServer(deviceID string) error {
+	log.Printf("Connecting to %s...", serverURL)
+	conn, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	// 1. Send HELLO
-	hello := protocol.Message{
+	// If the service is stopped, close the connection immediately to unblock ReadJSON
+	go func() {
+		select {
+		case <-p.exit:
+			conn.Close()
+		}
+	}()
+
+	// Send HELLO
+	err = sendMsg(conn, protocol.Message{
 		Type:     protocol.MsgHello,
 		DeviceID: deviceID,
-		Version:  "0.1.0",
-	}
-	if err := conn.WriteJSON(hello); err != nil {
+		Version:  agentVersion,
+	})
+	if err != nil {
 		return err
 	}
 
-	// 2. Start Heartbeat goroutine
-	done := make(chan struct{})
-	defer close(done)
+	// Start Heartbeat loop
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
 		for {
 			select {
-			case <-done:
-				return
 			case <-ticker.C:
-				conn.WriteJSON(protocol.Message{Type: protocol.MsgHeartbeat})
+				sendMsg(conn, protocol.Message{Type: protocol.MsgHeartbeat})
+			case <-p.exit:
+				return
 			}
 		}
 	}()
 
-	// 3. Read loop
+	// Main Read Loop
 	for {
 		var msg protocol.Message
 		err := conn.ReadJSON(&msg)
-		if err != nil { return err }
-	
+		if err != nil {
+			return err // Network error or connection closed; return triggers reconnect
+		}
+
 		switch msg.Type {
 		case protocol.MsgAuthOK:
 			log.Println("Authenticated with VPS successfully.")
 		case protocol.MsgExec:
-			// Launch goroutine so long-running tasks don't block heartbeats
 			go func(req protocol.Message) {
 				res := executeOperation(req)
 				sendMsg(conn, res)
@@ -85,33 +166,7 @@ func connectAndRun(deviceID string) error {
 	}
 }
 
-// getOrCreateDeviceID ensures the device has a permanent identity (Test 3)
-func getOrCreateDeviceID() string {
-	const filename = "device_id.txt"
-	data, err := os.ReadFile(filename)
-	if err == nil && len(data) > 0 {
-		return string(data)
-	}
-
-	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	newID := hex.EncodeToString(bytes)
-	
-	os.WriteFile(filename, []byte(newID), 0600)
-	return newID
-}
-
-func sendMsg(conn *websocket.Conn, msg protocol.Message) error {
-	writeMutex.Lock()
-	defer writeMutex.Unlock()
-	return conn.WriteJSON(msg)
-}
-
-
-// The explicit authorization dispatcher
 func executeOperation(req protocol.Message) protocol.Message {
-	log.Printf("Executing operation: %s (%s)", req.Operation, req.RequestID)
-	
 	res := protocol.Message{
 		Type:      protocol.MsgExecResult,
 		RequestID: req.RequestID,
@@ -122,24 +177,20 @@ func executeOperation(req protocol.Message) protocol.Message {
 	switch req.Operation {
 	case "status":
 		res.Result["status"] = "ONLINE"
-		res.Result["agent_version"] = "0.1.0"
-		
+		res.Result["agent_version"] = agentVersion
 	case "system-info":
 		res.Result["os"] = runtime.GOOS
 		res.Result["arch"] = runtime.GOARCH
 		res.Result["cpus"] = strconv.Itoa(runtime.NumCPU())
-		
 	case "run-task":
-		// Example named task simulation
 		taskName := req.Args["task"]
 		if taskName == "update-dashboard" {
-			time.Sleep(2 * time.Second) // Simulate work
+			time.Sleep(2 * time.Second)
 			res.Result["output"] = "Dashboard updated successfully."
 		} else {
 			res.Success = false
 			res.Error = "Unknown task: " + taskName
 		}
-		
 	default:
 		res.Success = false
 		res.Error = "operation not permitted"
@@ -147,4 +198,35 @@ func executeOperation(req protocol.Message) protocol.Message {
 	return res
 }
 
-// Update heartbeats and HELLO to use sendMsg(conn, ...) instead of conn.WriteJSON
+func sendMsg(conn *websocket.Conn, msg protocol.Message) error {
+	writeMutex.Lock()
+	defer writeMutex.Unlock()
+	return conn.WriteJSON(msg)
+}
+
+// getDeviceID handles Phase 4 Persistent Identity rules
+func getDeviceID() string {
+	var dataDir string
+	if runtime.GOOS == "windows" {
+		dataDir = filepath.Join(os.Getenv("ProgramData"), "Kotman")
+	} else {
+		dataDir = "/var/lib/kotman"
+	}
+
+	os.MkdirAll(dataDir, 0755)
+	idFile := filepath.Join(dataDir, "device-id")
+
+	// Try to read existing ID
+	b, err := os.ReadFile(idFile)
+	if err == nil && len(b) > 0 {
+		return string(b)
+	}
+
+	// Generate new ID if not found
+	newID := make([]byte, 16)
+	rand.Read(newID)
+	idStr := hex.EncodeToString(newID)
+
+	os.WriteFile(idFile, []byte(idStr), 0644)
+	return idStr
+}
