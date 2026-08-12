@@ -9,6 +9,8 @@ import (
 	"os"
 	"text/tabwriter"
 	"time"
+
+	"kotman/protocol"
 )
 
 const AdminURL = "http://127.0.0.1:8081/api"
