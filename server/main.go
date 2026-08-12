@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"kotman/internal/db"
@@ -12,6 +14,22 @@ import (
 )
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+// Device holds the active WebSocket connection and pending command requests
+type Device struct {
+	ID       string
+	Status   string
+	LastSeen time.Time
+	Conn     *websocket.Conn
+
+	PendingMutex sync.Mutex
+	Pending      map[string]chan protocol.Message
+}
+
+var (
+	devices = make(map[string]*Device)
+	mutex   sync.Mutex // Protects the devices map
+)
 
 func main() {
 	if err := db.InitDB("kotman.db"); err != nil {
@@ -35,42 +53,86 @@ func main() {
 	http.HandleFunc("/api/ps", apiPS)
 	http.HandleFunc("/api/rename", apiRename)
 	http.HandleFunc("/api/inspect", apiInspect)
+	http.HandleFunc("/api/exec", apiExec)
+	
 	log.Println("Listening for CLI on 127.0.0.1:8081")
 	log.Fatal(http.ListenAndServe("127.0.0.1:8081", nil))
 }
 
 func handleAgentConnection(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	var deviceID string
 
 	defer func() {
 		if deviceID != "" {
 			db.DB.Exec("UPDATE devices SET status = 'OFFLINE' WHERE device_id = ?", deviceID)
+			
+			// Remove from active memory map
+			mutex.Lock()
+			delete(devices, deviceID)
+			mutex.Unlock()
 		}
 		conn.Close()
 	}()
 
 	for {
 		var msg protocol.Message
-		if err := conn.ReadJSON(&msg); err != nil { break }
+		if err := conn.ReadJSON(&msg); err != nil {
+			break
+		}
 
 		switch msg.Type {
 		case protocol.MsgHello:
 			deviceID = msg.DeviceID
 			nickname, _ := db.RegisterOrConnect(deviceID, msg.Version)
+			
+			// Store connection in memory so apiExec can reach it
+			mutex.Lock()
+			devices[deviceID] = &Device{
+				ID:       deviceID,
+				Status:   "ONLINE",
+				LastSeen: time.Now(),
+				Conn:     conn,
+				Pending:  make(map[string]chan protocol.Message),
+			}
+			mutex.Unlock()
+			
 			log.Printf("Agent Connected: %s (%s)", nickname, deviceID)
 			conn.WriteJSON(protocol.Message{Type: protocol.MsgAuthOK})
 
 		case protocol.MsgHeartbeat:
-			now := time.Now().Format(time.RFC3339)
-			db.DB.Exec("UPDATE devices SET last_seen = ?, status = 'ONLINE' WHERE device_id = ?", now, deviceID)
+			now := time.Now()
+			db.DB.Exec("UPDATE devices SET last_seen = ?, status = 'ONLINE' WHERE device_id = ?", now.Format(time.RFC3339), deviceID)
+			
+			mutex.Lock()
+			if dev, ok := devices[deviceID]; ok {
+				dev.LastSeen = now
+			}
+			mutex.Unlock()
+			
 			conn.WriteJSON(protocol.Message{Type: protocol.MsgHeartbeatAck})
+			
+		case protocol.MsgExecResult:
+			// Route command results back to the waiting CLI HTTP request
+			mutex.Lock()
+			dev, ok := devices[deviceID]
+			mutex.Unlock()
+			
+			if ok {
+				dev.PendingMutex.Lock()
+				if ch, pendingOk := dev.Pending[msg.RequestID]; pendingOk {
+					ch <- msg
+					delete(dev.Pending, msg.RequestID)
+				}
+				dev.PendingMutex.Unlock()
+			}
 		}
 	}
 }
 
-// monitorTimeouts automatically marks devices offline if no heartbeat in 15s
 func monitorTimeouts() {
 	for {
 		time.Sleep(5 * time.Second)
@@ -78,6 +140,8 @@ func monitorTimeouts() {
 		db.DB.Exec("UPDATE devices SET status = 'OFFLINE' WHERE last_seen < ? AND status = 'ONLINE'", timeoutThreshold)
 	}
 }
+
+// --- ADMIN API Handlers for CLI ---
 
 func apiPS(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.DB.Query("SELECT device_id, nickname, status, first_seen, last_seen, agent_version FROM devices")
@@ -87,17 +151,17 @@ func apiPS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var devices []map[string]string
+	var devs []map[string]string
 	for rows.Next() {
 		var id, name, status, first, last, ver string
 		rows.Scan(&id, &name, &status, &first, &last, &ver)
-		devices = append(devices, map[string]string{
+		devs = append(devs, map[string]string{
 			"device_id": id, "nickname": name, "status": status,
 			"first_seen": first, "last_seen": last, "agent_version": ver,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(devices)
+	json.NewEncoder(w).Encode(devs)
 }
 
 func apiRename(w http.ResponseWriter, r *http.Request) {
@@ -129,36 +193,7 @@ func apiInspect(w http.ResponseWriter, r *http.Request) {
 		"first_seen": first, "last_seen": last, "agent_version": ver,
 	})
 }
-// --- ADMIN API Handlers for CLI ---
-// Implementation omitted for brevity, but they just run standard SELECT/UPDATE
-// queries on the SQLite DB and return JSON. E.g. UPDATE devices SET nickname=?
 
-//---
-// 1. Update the Device struct to hold pending requests
-type Device struct {
-	ID       string
-	Status   string
-	LastSeen time.Time
-	Conn     *websocket.Conn
-	
-	PendingMutex sync.Mutex
-	Pending      map[string]chan protocol.Message
-}
-
-// 2. In handleAgentConnection, initialize the map and handle MsgExecResult:
-// devices[deviceID] = &Device{ ... Pending: make(map[string]chan protocol.Message) }
-
-// Inside the read loop:
-case protocol.MsgExecResult:
-	dev := devices[deviceID]
-	dev.PendingMutex.Lock()
-	if ch, ok := dev.Pending[msg.RequestID]; ok {
-		ch <- msg // Route response back to the waiting HTTP handler
-		delete(dev.Pending, msg.RequestID)
-	}
-	dev.PendingMutex.Unlock()
-
-// 3. Add the new Admin API Handler (Don't forget to register it in main(): http.HandleFunc("/api/exec", apiExec))
 func apiExec(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Target    string            `json:"target"`
@@ -169,15 +204,20 @@ func apiExec(w http.ResponseWriter, r *http.Request) {
 
 	var deviceID, status string
 	err := db.DB.QueryRow("SELECT device_id, status FROM devices WHERE nickname = ?", req.Target).Scan(&deviceID, &status)
-	
+
 	if err != nil || status != "ONLINE" {
 		http.Error(w, "Device offline or not found", http.StatusNotFound)
 		return
 	}
 
 	mutex.Lock()
-	dev := devices[deviceID]
+	dev, ok := devices[deviceID]
 	mutex.Unlock()
+
+	if !ok {
+		http.Error(w, "Device socket connection not found", http.StatusNotFound)
+		return
+	}
 
 	reqID := fmt.Sprintf("req-%d", time.Now().UnixNano())
 	respChan := make(chan protocol.Message, 1)
@@ -186,7 +226,7 @@ func apiExec(w http.ResponseWriter, r *http.Request) {
 	dev.Pending[reqID] = respChan
 	dev.PendingMutex.Unlock()
 
-	// Send to Agent
+	// Send command down the websocket to the Agent
 	dev.Conn.WriteJSON(protocol.Message{
 		Type:      protocol.MsgExec,
 		RequestID: reqID,
@@ -204,7 +244,7 @@ func apiExec(w http.ResponseWriter, r *http.Request) {
 		dev.PendingMutex.Lock()
 		delete(dev.Pending, reqID)
 		dev.PendingMutex.Unlock()
-		
+
 		db.LogOperation(deviceID, req.Operation, false, "timeout")
 		http.Error(w, `{"error": "timeout"}`, http.StatusGatewayTimeout)
 	}
