@@ -27,6 +27,14 @@ func InitDB(filepath string) error {
 		last_seen DATETIME,
 		agent_version TEXT
 	);
+	CREATE TABLE IF NOT EXISTS audit_logs (
+		log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		device_id TEXT,
+		operation TEXT,
+		success BOOLEAN,
+		error_msg TEXT,
+		executed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	CREATE TABLE IF NOT EXISTS sequence (
 		name TEXT PRIMARY KEY,
 		val INTEGER
@@ -72,4 +80,15 @@ func RegisterOrConnect(deviceID, version string) (string, error) {
 
 	if err != nil { return "", err }
 	return nickname, tx.Commit()
+}
+
+func LogOperation(deviceID, operation string, success bool, errorMsg string) {
+	_, err := DB.Exec(`
+		INSERT INTO audit_logs (device_id, operation, success, error_msg) 
+		VALUES (?, ?, ?, ?)`, 
+		deviceID, operation, success, errorMsg)
+	if err != nil {
+		// Log error internally, but don't crash the server
+		fmt.Println("Audit log error:", err)
+	}
 }
