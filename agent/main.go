@@ -70,14 +70,18 @@ func connectAndRun(deviceID string) error {
 	for {
 		var msg protocol.Message
 		err := conn.ReadJSON(&msg)
-		if err != nil {
-			return err // Breaks read loop, triggers reconnect in main()
-		}
-
-		if msg.Type == protocol.MsgAuthOK {
+		if err != nil { return err }
+	
+		switch msg.Type {
+		case protocol.MsgAuthOK:
 			log.Println("Authenticated with VPS successfully.")
+		case protocol.MsgExec:
+			// Launch goroutine so long-running tasks don't block heartbeats
+			go func(req protocol.Message) {
+				res := executeOperation(req)
+				sendMsg(conn, res)
+			}(msg)
 		}
-		// We silently consume HEARTBEAT_ACK here to verify the server is alive
 	}
 }
 
@@ -103,23 +107,6 @@ func sendMsg(conn *websocket.Conn, msg protocol.Message) error {
 	return conn.WriteJSON(msg)
 }
 
-// In connectAndRun(), update the read loop to dispatch commands:
-for {
-	var msg protocol.Message
-	err := conn.ReadJSON(&msg)
-	if err != nil { return err }
-
-	switch msg.Type {
-	case protocol.MsgAuthOK:
-		log.Println("Authenticated with VPS successfully.")
-	case protocol.MsgExec:
-		// Launch goroutine so long-running tasks don't block heartbeats
-		go func(req protocol.Message) {
-			res := executeOperation(req)
-			sendMsg(conn, res)
-		}(msg)
-	}
-}
 
 // The explicit authorization dispatcher
 func executeOperation(req protocol.Message) protocol.Message {
