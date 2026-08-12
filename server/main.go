@@ -132,3 +132,80 @@ func apiInspect(w http.ResponseWriter, r *http.Request) {
 // --- ADMIN API Handlers for CLI ---
 // Implementation omitted for brevity, but they just run standard SELECT/UPDATE
 // queries on the SQLite DB and return JSON. E.g. UPDATE devices SET nickname=?
+
+//---
+// 1. Update the Device struct to hold pending requests
+type Device struct {
+	ID       string
+	Status   string
+	LastSeen time.Time
+	Conn     *websocket.Conn
+	
+	PendingMutex sync.Mutex
+	Pending      map[string]chan protocol.Message
+}
+
+// 2. In handleAgentConnection, initialize the map and handle MsgExecResult:
+// devices[deviceID] = &Device{ ... Pending: make(map[string]chan protocol.Message) }
+
+// Inside the read loop:
+case protocol.MsgExecResult:
+	dev := devices[deviceID]
+	dev.PendingMutex.Lock()
+	if ch, ok := dev.Pending[msg.RequestID]; ok {
+		ch <- msg // Route response back to the waiting HTTP handler
+		delete(dev.Pending, msg.RequestID)
+	}
+	dev.PendingMutex.Unlock()
+
+// 3. Add the new Admin API Handler (Don't forget to register it in main(): http.HandleFunc("/api/exec", apiExec))
+func apiExec(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Target    string            `json:"target"`
+		Operation string            `json:"operation"`
+		Args      map[string]string `json:"args"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	var deviceID, status string
+	err := db.DB.QueryRow("SELECT device_id, status FROM devices WHERE nickname = ?", req.Target).Scan(&deviceID, &status)
+	
+	if err != nil || status != "ONLINE" {
+		http.Error(w, "Device offline or not found", http.StatusNotFound)
+		return
+	}
+
+	mutex.Lock()
+	dev := devices[deviceID]
+	mutex.Unlock()
+
+	reqID := fmt.Sprintf("req-%d", time.Now().UnixNano())
+	respChan := make(chan protocol.Message, 1)
+
+	dev.PendingMutex.Lock()
+	dev.Pending[reqID] = respChan
+	dev.PendingMutex.Unlock()
+
+	// Send to Agent
+	dev.Conn.WriteJSON(protocol.Message{
+		Type:      protocol.MsgExec,
+		RequestID: reqID,
+		Operation: req.Operation,
+		Args:      req.Args,
+	})
+
+	// Wait for Agent response with a 10-second timeout
+	select {
+	case result := <-respChan:
+		db.LogOperation(deviceID, req.Operation, result.Success, result.Error)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	case <-time.After(10 * time.Second):
+		dev.PendingMutex.Lock()
+		delete(dev.Pending, reqID)
+		dev.PendingMutex.Unlock()
+		
+		db.LogOperation(deviceID, req.Operation, false, "timeout")
+		http.Error(w, `{"error": "timeout"}`, http.StatusGatewayTimeout)
+	}
+}
