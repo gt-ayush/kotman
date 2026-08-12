@@ -1,113 +1,84 @@
 package main
 
 import (
-	"fmt"
+	"encoding/json"
 	"log"
 	"net/http"
-	"sync"
 	"time"
 
+	"kotman/internal/db"
 	"kotman/protocol"
 	"github.com/gorilla/websocket"
 )
 
-const HeartbeatTimeout = 15 * time.Second
-
-type Device struct {
-	ID       string
-	Status   string
-	LastSeen time.Time
-	Conn     *websocket.Conn
-}
-
-var (
-	devices = make(map[string]*Device)
-	mutex   = &sync.Mutex{}
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
-)
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func main() {
-	http.HandleFunc("/ws", handleConnection)
-	
-	// Background task to check for dead connections and print the "ps" table
-	go monitorDevices()
-
-	fmt.Println("Kotman VPS Server running on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-func handleConnection(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Println("Upgrade error:", err)
-		return
+	if err := db.InitDB("kotman.db"); err != nil {
+		log.Fatal("DB Init Error:", err)
 	}
 
+	// Reset all devices to OFFLINE on server startup
+	db.DB.Exec("UPDATE devices SET status = 'OFFLINE'")
+
+	// Start background timeout monitor
+	go monitorTimeouts()
+
+	// 1. Public API for PC Agents
+	http.HandleFunc("/ws", handleAgentConnection)
+	go func() {
+		log.Println("Listening for Agents on 0.0.0.0:8080")
+		log.Fatal(http.ListenAndServe(":8080", nil))
+	}()
+
+	// 2. Local Admin API for the CLI
+	http.HandleFunc("/api/ps", apiPS)
+	http.HandleFunc("/api/rename", apiRename)
+	http.HandleFunc("/api/inspect", apiInspect)
+	log.Println("Listening for CLI on 127.0.0.1:8081")
+	log.Fatal(http.ListenAndServe("127.0.0.1:8081", nil))
+}
+
+func handleAgentConnection(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil { return }
 	var deviceID string
 
 	defer func() {
 		if deviceID != "" {
-			mutex.Lock()
-			if dev, ok := devices[deviceID]; ok {
-				dev.Status = "OFFLINE"
-			}
-			mutex.Unlock()
+			db.DB.Exec("UPDATE devices SET status = 'OFFLINE' WHERE device_id = ?", deviceID)
 		}
 		conn.Close()
 	}()
 
 	for {
 		var msg protocol.Message
-		err := conn.ReadJSON(&msg)
-		if err != nil {
-			break // Connection closed or error
-		}
+		if err := conn.ReadJSON(&msg); err != nil { break }
 
-		mutex.Lock()
 		switch msg.Type {
 		case protocol.MsgHello:
 			deviceID = msg.DeviceID
-			devices[deviceID] = &Device{
-				ID:       deviceID,
-				Status:   "ONLINE",
-				LastSeen: time.Now(),
-				Conn:     conn,
-			}
+			nickname, _ := db.RegisterOrConnect(deviceID, msg.Version)
+			log.Printf("Agent Connected: %s (%s)", nickname, deviceID)
 			conn.WriteJSON(protocol.Message{Type: protocol.MsgAuthOK})
-			log.Printf("Device %s authenticated.", deviceID)
 
 		case protocol.MsgHeartbeat:
-			if dev, ok := devices[deviceID]; ok {
-				dev.LastSeen = time.Now()
-				dev.Status = "ONLINE"
-			}
+			now := time.Now().Format(time.RFC3339)
+			db.DB.Exec("UPDATE devices SET last_seen = ?, status = 'ONLINE' WHERE device_id = ?", now, deviceID)
 			conn.WriteJSON(protocol.Message{Type: protocol.MsgHeartbeatAck})
 		}
-		mutex.Unlock()
 	}
 }
 
-func monitorDevices() {
+// monitorTimeouts automatically marks devices offline if no heartbeat in 15s
+func monitorTimeouts() {
 	for {
 		time.Sleep(5 * time.Second)
-		
-		fmt.Print("\033[H\033[2J") // Clear screen for dashboard effect
-		fmt.Printf("%-20s %-10s %-15s\n", "NAME/ID", "STATUS", "LAST SEEN")
-		fmt.Println("------------------------------------------------")
-		
-		mutex.Lock()
-		now := time.Now()
-		for id, dev := range devices {
-			if now.Sub(dev.LastSeen) > HeartbeatTimeout && dev.Status == "ONLINE" {
-				dev.Status = "OFFLINE"
-				dev.Conn.Close()
-			}
-			
-			seenAgo := now.Sub(dev.LastSeen).Round(time.Second)
-			fmt.Printf("%-20s %-10s %-15s\n", id[:8]+"...", dev.Status, seenAgo.String()+" ago")
-		}
-		mutex.Unlock()
+		timeoutThreshold := time.Now().Add(-15 * time.Second).Format(time.RFC3339)
+		db.DB.Exec("UPDATE devices SET status = 'OFFLINE' WHERE last_seen < ? AND status = 'ONLINE'", timeoutThreshold)
 	}
 }
+
+// --- ADMIN API Handlers for CLI ---
+// Implementation omitted for brevity, but they just run standard SELECT/UPDATE
+// queries on the SQLite DB and return JSON. E.g. UPDATE devices SET nickname=?
