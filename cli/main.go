@@ -61,6 +61,19 @@ func main() {
 			}
 		}
 		runExec(os.Args[2], os.Args[3], args)
+	case "tunnel":
+		if len(os.Args) >= 3 && os.Args[2] == "ls" {
+			// call /api/tunnel/ls
+		} else if len(os.Args) >= 4 && os.Args[2] == "rm" {
+			// call /api/tunnel/rm
+		} else if len(os.Args) == 5 && os.Args[2] == "-p" {
+			// e.g., kotman tunnel -p 8000:3000 gaming-pc
+			parts := strings.Split(os.Args[3], ":")
+			vpsPort, _ := strconv.Atoi(parts[0])
+			localPort, _ := strconv.Atoi(parts[1])
+			targetPC := os.Args[4]
+			// call /api/tunnel/create
+		}
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
 	}
