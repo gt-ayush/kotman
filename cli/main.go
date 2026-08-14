@@ -7,11 +7,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
-	"strconv"
-	
+
 	"kotman/protocol"
 )
 
@@ -26,9 +26,16 @@ type DeviceData struct {
 	AgentVersion string `json:"agent_version"`
 }
 
+type TunnelData struct {
+	ID        string `json:"id"`
+	PC        string `json:"pc"`
+	VPSPort   int    `json:"vps_port"`
+	LocalPort int    `json:"local_port"`
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: kotman <ps|rename|inspect|exec>")
+		fmt.Println("Usage: kotman <ps|rename|inspect|exec|tunnel>")
 		return
 	}
 
@@ -64,16 +71,23 @@ func main() {
 		runExec(os.Args[2], os.Args[3], args)
 	case "tunnel":
 		if len(os.Args) >= 3 && os.Args[2] == "ls" {
-			// call /api/tunnel/ls
+			runTunnelLs()
 		} else if len(os.Args) >= 4 && os.Args[2] == "rm" {
-			// call /api/tunnel/rm
+			runTunnelRm(os.Args[3])
 		} else if len(os.Args) == 5 && os.Args[2] == "-p" {
-			// e.g., kotman tunnel -p 8000:3000 gaming-pc
 			parts := strings.Split(os.Args[3], ":")
-			vpsPort, _ := strconv.Atoi(parts[0])
-			localPort, _ := strconv.Atoi(parts[1])
-			targetPC := os.Args[4]
-			// call /api/tunnel/create
+			if len(parts) != 2 {
+				fmt.Println("Invalid port mapping. Use VPS_PORT:LOCAL_PORT")
+				return
+			}
+			vp, _ := strconv.Atoi(parts[0])
+			lp, _ := strconv.Atoi(parts[1])
+			runTunnelCreate(os.Args[4], vp, lp)
+		} else {
+			fmt.Println("Usage:")
+			fmt.Println("  kotman tunnel ls")
+			fmt.Println("  kotman tunnel rm <tunnel_id>")
+			fmt.Println("  kotman tunnel -p <VPS_PORT>:<LOCAL_PORT> <pc_name>")
 		}
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
@@ -174,5 +188,64 @@ func runExec(target, operation string, args map[string]string) {
 		}
 	} else {
 		fmt.Printf("Operation Failed: %s\n", result.Error)
+	}
+}
+
+func runTunnelCreate(target string, vpsPort, localPort int) {
+	payload, _ := json.Marshal(map[string]any{
+		"target":     target,
+		"vps_port":   vpsPort,
+		"local_port": localPort,
+	})
+
+	resp, err := http.Post(AdminURL+"/tunnel/create", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		fmt.Println("Network error:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Printf("Failed to create tunnel: %s\n", string(body))
+		return
+	}
+
+	fmt.Printf("Tunnel created! VPS:%d -> %s:%d\n", vpsPort, target, localPort)
+}
+
+func runTunnelLs() {
+	resp, err := http.Get(AdminURL + "/tunnel/ls")
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var tunnels []TunnelData
+	json.NewDecoder(resp.Body).Decode(&tunnels)
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "ID\tPC\tVPS_PORT\tLOCAL_PORT")
+
+	for _, t := range tunnels {
+		fmt.Fprintf(w, "%s\t%s\t%d\t%d\n", t.ID, t.PC, t.VPSPort, t.LocalPort)
+	}
+	w.Flush()
+}
+
+func runTunnelRm(tunnelID string) {
+	payload, _ := json.Marshal(map[string]string{"tunnel_id": tunnelID})
+	resp, err := http.Post(AdminURL+"/tunnel/rm", "application/json", bytes.NewBuffer(payload))
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		fmt.Printf("Tunnel %s removed successfully.\n", tunnelID)
+	} else {
+		fmt.Println("Failed to remove tunnel.")
 	}
 }
