@@ -1,6 +1,8 @@
 # Kotman - Lightweight Agent & Remote Management System
 
-Kotman is a lightweight, cross-platform remote node management system built in Go. It connects remote agent devices to a central VPS server via WebSocket, providing secure remote inspection, persistent device identification, and explicit, shell-free command execution through a local CLI.
+Kotman is a custom Remote Access and Reverse Tunneling tool written in Go. It allows you to manage multiple PCs, execute remote commands, and securely expose local services behind firewalls to the public internet using a central VPS server.
+
+It functions similarly to tools like Ngrok or Tailscale, but is entirely self-hosted.
 
 ---
 
@@ -19,9 +21,20 @@ Kotman is a lightweight, cross-platform remote node management system built in G
 
 ```
 
-* **Server:** Manages WebSocket connections, tracks node health, logs audit records, and exposes an HTTP REST API on `localhost:8081` for administrative tasks.
-* **Agent:** Runs as a native background OS service (systemd or Windows Service), maintains persistent device identity, auto-reconnects on network loss, and handles pre-authorized operations.
-* **CLI:** Command-line tool used by administrators on the server to query nodes and issue remote execution tasks.
+1.  **Server (VPS):** The central hub. It maintains active WebSocket connections with all agents, manages the SQLite database, exposes a REST API for the CLI, and acts as the public entry point for reverse tunnels.
+2.  **Agent (PC):** A lightweight client that runs on the target machines. It connects outbound to the VPS via WebSocket, executes requested commands, and creates local TCP connections for active tunnels.
+3.  **CLI:** The administrative interface used to interact with the Server, view connected devices, execute commands, and manage port forwarding.
+
+---
+
+## Features
+
+*   **Fleet Management:** View all connected devices, their online status, and the last time they pinged the server.
+*   **Remote Execution (RPC):** Run arbitrary shell commands on any connected agent and receive the output instantly.
+*   **Reverse Tunnels (Port Forwarding):** Expose any local port on a remote PC to a public port on the VPS (e.g., map VPS port 8000 to PC port 3000).
+*   **WebSocket Data Pumping:** High-performance, side-channel WebSocket streams strictly for routing raw TCP byte data.
+*   **Device Nicknames:** Rename randomly generated device IDs to human-readable names (e.g., `PC-002`).
+*   **Persistent Storage:** SQLite database tracks devices and active tunnel configurations.
 
 ---
 
