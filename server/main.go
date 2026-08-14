@@ -277,3 +277,15 @@ func apiExec(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error": "timeout"}`, http.StatusGatewayTimeout)
 	}
 }
+
+func handleTunnelData(w http.ResponseWriter, r *http.Request) {
+    streamID := r.URL.Query().Get("stream_id")
+    if streamID == "" { return }
+    
+    conn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil { return }
+    
+    if !TunnelManager.RegisterDataStream(streamID, conn) {
+        conn.Close() // stream_id invalid or expired
+    }
+}
