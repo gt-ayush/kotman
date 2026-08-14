@@ -22,7 +22,7 @@ import (
 
 // In a real deployment, you'd read this from config.json
 const serverURL = "ws://127.0.0.1:8080/ws"
-const agentVersion = "0.1.0"
+const agentVersion = "v0.1.1"
 
 var writeMutex sync.Mutex
 
