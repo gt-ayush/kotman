@@ -7,6 +7,7 @@ const (
 	MsgHeartbeatAck = "HEARTBEAT_ACK"
 	MsgExec         = "EXEC"
 	MsgExecResult   = "EXEC_RESULT"
+	MsgTunnelReq    = "TUNNEL_REQ"
 )
 
 type Message struct {
