@@ -16,6 +16,7 @@ import (
 	"kotman/protocol"
 
 	"github.com/gorilla/websocket"
+	"kotman/internal/tunnel"
 	"github.com/kardianos/service"
 )
 
