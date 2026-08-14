@@ -161,6 +161,10 @@ func (p *program) connectToServer(deviceID string) error {
 				res := executeOperation(req)
 				sendMsg(conn, res)
 			}(msg)
+
+		// dispatcher loop for tunnels:
+		case protocol.MsgTunnelReq:
+			go handleTunnelReq(msg)
 		}
 	}
 }
@@ -228,4 +232,32 @@ func getDeviceID() string {
 
 	os.WriteFile(idFile, []byte(idStr), 0644)
 	return idStr
+}
+
+
+
+// Handler function
+func handleTunnelReq(req protocol.Message) {
+    streamID := req.RequestID
+    localPort, _ := strconv.Atoi(req.Args["local_port"])
+
+    // 1. Dial Local Service
+    tcp, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
+    if err != nil {
+        log.Printf("TunnelReq[%s]: failed to dial local port %d: %v", streamID, localPort, err)
+        return
+    }
+
+    // 2. Dial VPS side-channel
+    // Switch ws:// to wss:// if using TLS in production
+    wsURL := fmt.Sprintf("ws://127.0.0.1:8080/api/tunnel/data?stream_id=%s", streamID)
+    ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+    if err != nil {
+        log.Printf("TunnelReq[%s]: failed to dial VPS side-channel: %v", streamID, err)
+        tcp.Close()
+        return
+    }
+
+    // 3. Link them!
+    go tunnel.Pump(ws, tcp)
 }
