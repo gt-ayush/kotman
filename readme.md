@@ -1,40 +1,98 @@
-# Kotman - Lightweight Agent & Remote Management System
+# Kotman — Lightweight Agent & Remote Management System
 
-Kotman is a custom Remote Access and Reverse Tunneling tool written in Go. It allows you to manage multiple PCs, execute remote commands, and securely expose local services behind firewalls to the public internet using a central VPS server.
+Kotman is an open-source, high-performance Remote Access, Fleet Management, and Reverse Tunneling platform written in Go. It enables secure fleet administration, constrained remote command execution (RPC), and reverse port forwarding across NAT boundaries and firewalls via a single central VPS server.
 
-It functions similarly to tools like Ngrok or Tailscale, but is entirely self-hosted.
+Designed as a self-hosted alternative to tools like Ngrok or Tailscale, Kotman decouples the **Control Plane** (WebSockets RPC & REST API) from the **Data Plane** (side-channel byte-streaming proxies).
 
 ---
 
-## Architecture
+## Key Capabilities
+
+* **Fleet Visibility & Monitoring:** Real-time online/offline heartbeats, device tracking, and node metadata inspection.
+* **Controlled Remote Execution (RPC):** Dispatches predefined, whitelisted maintenance tasks to remote agents without exposing a dangerous raw shell.
+* **High-Performance Reverse Tunneling:** Expose internal HTTP/TCP services running behind strict firewalls to public listening ports on your VPS.
+* **Multiplexed Side-Channel Streaming:** Dedicated high-throughput WebSocket streams strictly dedicated to bi-directional binary byte pumping.
+* **Native OS Daemon Integration:** Cross-platform background service management (systemd on Linux, Service Control Manager on Windows) using persistent device IDs.
+* **Audited Operations:** Persistent SQLite storage tracks all registered nodes, active tunnel configurations, and RPC execution logs.
+
+---
+
+## System Architecture
+
+Kotman enforces a strict separation between command orchestration and data proxying.
 
 ```text
-┌──────────────┐         WebSocket (Port 8080)        ┌──────────────┐
-│ Kotman Agent │ <==================================> │ Kotman Server│
-└──────────────┘                                      └──────┬───────┘
-  (Linux / Win)                                              │ SQLite DB
-                                                      Local HTTP API (Port 8081)
-                                                             │
-                                                      ┌──────┴───────┐
-                                                      │  Kotman CLI  │
-                                                      └──────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                  KOTMAN SYSTEM                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+ ┌──────────────────┐           Control WebSocket (Port 8080)         ┌──────────────┐
+ │   Target Agent   │ <=============================================> │  VPS Server  │
+ │  (Remote Machine)│                                                 └──────┬───────┘
+ └────────┬─────────┘           Data Stream WebSocket (/api/tunnel/data)     │
+          │                   <=======================================>      │
+          │                                                                  │
+ ┌────────┴─────────┐                                                 ┌──────┴───────┐
+ │ Local Service    │                                                 │ SQLite DB    │
+ │ (e.g. Port 3000) │                                                 │ (kotman.db)  │
+ └──────────────────┘                                                 └──────┬───────┘
+                                                                             │
+                                                                 Admin API (Port 8081)
+                                                                             │
+                                                                      ┌──────┴───────┐
+                                                                      │  Kotman CLI  │
+                                                                      └──────────────┘
 
 ```
 
-1.  **Server (VPS):** The central hub. It maintains active WebSocket connections with all agents, manages the SQLite database, exposes a REST API for the CLI, and acts as the public entry point for reverse tunnels.
-2.  **Agent (PC):** A lightweight client that runs on the target machines. It connects outbound to the VPS via WebSocket, executes requested commands, and creates local TCP connections for active tunnels.
-3.  **CLI:** The administrative interface used to interact with the Server, view connected devices, execute commands, and manage port forwarding.
+### Component Breakdown
+
+1. **Central Server (`server/`)**
+* **Agent Listener (`:8080`)**: Maintains persistent WebSocket connections for heartbeats and RPC control messages.
+* **Admin REST API (`127.0.0.1:8081`)**: Local-only API handling CLI requests.
+* **Dynamic Tunnel Manager**: Binds public TCP ports on the VPS and handles bi-directional byte-pumping between public callers and agent data streams.
+
+
+2. **Client Agent (`agent/`)**
+* Runs as an OS service with auto-restart resilience.
+* Maintains persistent machine identity saved to disk.
+* Listens for control frame instructions and initiates side-channel connections for active data streams.
+
+
+3. **Admin CLI (`cli/`)**
+* Lightweight binary used by administrators on the server to manage nodes, invoke tasks, and manage public proxies.
+
+
 
 ---
 
-## Features
+## Database Schema Overview
 
-*   **Fleet Management:** View all connected devices, their online status, and the last time they pinged the server.
-*   **Remote Execution (RPC):** Run arbitrary shell commands on any connected agent and receive the output instantly.
-*   **Reverse Tunnels (Port Forwarding):** Expose any local port on a remote PC to a public port on the VPS (e.g., map VPS port 8000 to PC port 3000).
-*   **WebSocket Data Pumping:** High-performance, side-channel WebSocket streams strictly for routing raw TCP byte data.
-*   **Device Nicknames:** Rename randomly generated device IDs to human-readable names (e.g., `PC-002`).
-*   **Persistent Storage:** SQLite database tracks devices and active tunnel configurations.
+Kotman uses SQLite (`kotman.db`) for lightweight, zero-dependency persistence.
+
+```text
+  ┌──────────────────┐          ┌──────────────────┐
+  │     devices      │          │     tunnels      │
+  ├──────────────────┤          ├──────────────────┤
+  │ device_id   (PK) │ ───────< │ tunnel_id   (PK) │
+  │ nickname         │          │ device_id   (FK) │
+  │ status           │          │ vps_port         │
+  │ first_seen       │          │ local_port       │
+  │ last_seen        │          └──────────────────┘
+  │ agent_version    │
+  └──────────────────┘
+           │
+           │                    ┌──────────────────┐
+           │                    │    audit_logs    │
+           │                    ├──────────────────┤
+           └──────────────────< │ log_id      (PK) │
+                                │ device_id   (FK) │
+                                │ operation        │
+                                │ status           │
+                                │ timestamp        │
+                                └──────────────────┘
+
+```
 
 ---
 
@@ -42,12 +100,12 @@ It functions similarly to tools like Ngrok or Tailscale, but is entirely self-ho
 
 ```text
 kotman/
-├── agent/          # Background client agent and service wrapper
-├── cli/            # Administrative command-line tool
+├── agent/             # Client service, daemon lifecycle, execution dispatcher
+├── cli/               # Administrative command-line utility
 ├── internal/
-│   └── db/         # SQLite database initialization, registration, and audit logs
-├── protocol/       # Shared JSON message protocol definitions
-└── server/         # Central VPS server and local admin API
+│   └── db/            # SQLite initialization, schema migrations, and query interfaces
+├── protocol/          # Shared JSON message structures and control frame protocol
+└── server/            # VPS Hub, HTTP/WS endpoints, proxy listener manager
 
 ```
 
@@ -55,128 +113,213 @@ kotman/
 
 ## Prerequisites
 
-* **Go**: 1.20 or newer
-* **Database**: SQLite3 driver dependencies (handled automatically via `cgo` / `go.sqlite3`)
+* **Go Compiler:** Version 1.20 or newer
+* **C Compiler (GCC / MinGW):** Required for SQLite driver compilation (`cgo`)
+* **OS Support:** Linux (systemd), Windows (SCM), macOS
+
+---
+
+## Installation & Compilation
+
+Clone the repository and build the executables into a `bin/` directory:
+
+```bash
+git clone https://github.com/your-repo/kotman.git
+cd kotman
+
+# Compile server binary
+go build -o bin/kotman-server server/main.go
+
+# Compile agent binary
+go build -o bin/kotman-agent agent/main.go
+
+# Compile administrative CLI binary
+go build -o bin/kotman cli/main.go
+
+```
 
 ---
 
 ## Getting Started
 
-### 1. Build the Binaries
+### 1. Launching the Central Server
 
-```bash
-# Build the Server
-go build -o bin/kotman-server server/main.go
-
-# Build the Agent
-go build -o bin/kotman-agent agent/main.go
-
-# Build the CLI
-go build -o bin/kotman cli/main.go
-
-```
-
-### 2. Start the Server
+Run the server binary on your central VPS:
 
 ```bash
 ./bin/kotman-server
 
 ```
 
-* The server creates `kotman.db` automatically on first run.
-* Agent listener: `0.0.0.0:8080`
-* CLI API listener: `127.0.0.1:8081`
+> **Default Bindings:**
+> * Agent Control WebSocket: `0.0.0.0:8080`
+> * Admin REST API: `127.0.0.1:8081` *(Restricted to local loopback)*
+> 
+> 
 
 ---
 
-## OS Service Setup (Agent)
+### 2. Registering and Running the Agent
 
-The agent uses `kardianos/service` to run seamlessly as an OS-managed daemon with automatic startup on boot and auto-recovery on failure.
+#### Persistent Identity Storage
 
-### Persistent Identity Locations
-
-The agent generates a 16-byte hex device ID once and reuses it indefinitely:
+On its initial run, the agent generates a unique, immutable 16-byte hex identity stored at:
 
 * **Linux:** `/var/lib/kotman/device-id`
 * **Windows:** `C:\ProgramData\Kotman\device-id`
 
-### Linux (systemd)
+#### Deploying as an OS Service
+
+Kotman utilizes an embedded service manager (`kardianos/service`) for native daemon execution.
+
+##### **Linux (systemd)**
 
 ```bash
-# Install and start the service (requires elevated privileges)
+# Install and register systemd unit (requires root)
 sudo ./bin/kotman-agent install
+
+# Start the background service
 sudo ./bin/kotman-agent start
 
-# Check service status
+# Monitor service status
 systemctl status KotmanAgent
 
 ```
 
-### Windows (Service Control Manager)
+##### **Windows (Service Control Manager)**
 
 Open PowerShell as **Administrator**:
 
 ```powershell
-# Install and start the service
+# Install Windows Service
 .\bin\kotman-agent.exe install
+
+# Launch Windows Service
 .\bin\kotman-agent.exe start
 
-# Check service status
+# Inspect status
 Get-Service KotmanAgent
 
 ```
 
-To stop or remove the service on either OS, use `stop` or `uninstall`:
-
-```bash
-sudo ./bin/kotman-agent stop
-sudo ./bin/kotman-agent uninstall
-
-```
-
 ---
 
-## CLI Reference
+## CLI Command Reference
 
-All CLI commands interact with the local admin API (`[http://127.0.0.1:8081/api](http://127.0.0.1:8081/api)`).
+All administrative operations are executed via the `kotman` CLI on the VPS server.
 
-| Command | Usage | Description |
+### Command Matrix
+
+| Command | Syntax | Description |
 | --- | --- | --- |
-| **`ps`** | `kotman ps` | Lists all registered nodes, online status, and last seen timestamps. |
-| **`inspect`** | `kotman inspect <nickname>` | Shows detailed registration info and agent version for a node. |
-| **`rename`** | `kotman rename <old_name> <new_name>` | Assigns a custom alias to a node. |
-| **`exec`** | `kotman exec <nickname> <op> [k=v]` | Dispatches an explicit command to an online node. |
+| **`ps`** | `kotman ps` | Displays all registered agent nodes, online status, and last heartbeat. |
+| **`inspect`** | `kotman inspect <name>` | Fetches detailed metadata for a specific machine. |
+| **`rename`** | `kotman rename <old_name> <new_name>` | Assigns a human-readable alias to a node. |
+| **`exec`** | `kotman exec <name> <op> [k=v ...]` | Dispatches a whitelisted maintenance operation. |
+| **`tunnel -p`** | `kotman tunnel -p <VPS_PORT>:<LOCAL_PORT> <name>` | Binds a public VPS port and routes traffic to a local port on the node. |
+| **`tunnel ls`** | `kotman tunnel ls` | Lists all active port forwarding bridges. |
+| **`tunnel rm`** | `kotman tunnel rm <tunnel_id>` | Terminates an active tunnel and closes the public listening port. |
 
 ---
 
-## Remote Execution Commands
+### Operations & Output Examples
 
-To prevent arbitrary Remote Code Execution (RCE), Kotman uses explicit dispatch logic instead of raw shell execution.
-
-### Examples
+#### 1. Device Discovery (`ps`)
 
 ```bash
-# Get agent status
-./bin/kotman exec Main status
+$ kotman ps
 
-# Retrieve host OS, architecture, and CPU count
-./bin/kotman exec Main system-info
-
-# Run a whitelisted task with arguments
-./bin/kotman exec Main run-task task=update-dashboard
+NAME        STATUS   LAST SEEN
+PC-001      online   2s ago
+PC-002      online   0s ago
+Server-Dev  offline  14m ago
 
 ```
 
-### Response Codes & Errors
+#### 2. Device Metadata (`inspect`)
 
-* **`operation not permitted`**: The command is not implemented in the agent's dispatcher.
-* **`Device offline or not found`**: Target node is not connected to the WebSocket server.
-* **`timeout`**: Agent did not respond within the 10-second request window.
+```bash
+$ kotman inspect PC-002
+
+Device:   PC-002
+ID:       4f8b92a110cd9e01
+Status:   online
+Seen:     2026-08-14T17:05:00Z
+Agent:    v1.2.0
+
+```
+
+#### 3. Remote Execution (`exec`)
+
+```bash
+$ kotman exec PC-002 system-info
+
+os:          linux
+arch:        amd64
+cpus:        8
+hostname:    workstation-02
+
+```
+
+#### 4. Reverse Tunneling Setup (`tunnel`)
+
+Expose a web server running locally on `PC-002` (port 3000) to port `8000` on the public VPS:
+
+```bash
+# 1. Create the tunnel
+$ kotman tunnel -p 8000:3000 PC-002
+Tunnel created! VPS:8000 -> PC-002:3000
+
+# 2. Verify active tunnels
+$ kotman tunnel ls
+ID             PC       VPS_PORT   LOCAL_PORT
+t-1786727056   PC-002   8000       3000
+
+# 3. Terminate a tunnel
+$ kotman tunnel rm t-1786727056
+Tunnel t-1786727056 removed successfully.
+
+```
 
 ---
 
-## Security Model
+## Technical Deep-Dive: Reverse Tunnel Protocol
 
-1. **Zero Shell Execution:** The agent does not execute raw shell commands (`bash`, `cmd`, `powershell`). Operations must be explicitly coded in the agent's `executeOperation` function.
-2. **Local-Only Admin API:** The HTTP API handling CLI requests listens exclusively on `127.0.0.1:8081`.
-3. **Audit Logging:** Every execution request (successful or failed) is stored in the `audit_logs` SQLite table on the VPS with timestamps and operation details.
+When a public connection is established on a bound VPS tunnel port, Kotman processes the connection through a three-stage handshake:
+
+```text
+Public User           VPS Server               Agent Node            Local App
+    │                     │                        │                     │
+    ├─ TCP Connect ─────> │                        │                     │
+    │  (Port 8000)        │                        │                     │
+    │                     ├─ WS Control Frame ───> │                     │
+    │                     │  ("open_tunnel")       │                     │
+    │                     │                        ├─ Dial TCP ────────> │
+    │                     │                        │  (127.0.0.1:3000)   │
+    │                     │ <─ WS Data Stream ─────┤                     │
+    │                     │    (/api/tunnel/data)  │                     │
+    │                     │                        │                     │
+    │ <═══════════════════╧════════════════════════╧═══════════════════> │
+    │                   Bi-Directional Proxy Data Transfer              │
+
+```
+
+1. **Trigger:** A public client connects to `VPS_PORT` (e.g., `8000`).
+2. **Notification:** The VPS sends a JSON control frame over the main WebSocket to the target Agent containing a temporary `stream_id`.
+3. **Data Channel Dial:** The Agent connects back to `http://<VPS>/api/tunnel/data?stream_id=...` over a dedicated WebSocket, while simultaneously dialing `127.0.0.1:LOCAL_PORT` on its local machine.
+4. **Byte Pumping:** The VPS bridges the incoming raw TCP socket directly with the side-channel WebSocket stream, piping data in real-time until either peer closes the connection.
+
+---
+
+## Security Architecture
+
+1. **Strictly Non-RCE (No Raw Shells):** The agent rejects arbitrary shell strings (`bash`, `cmd.exe`, `powershell`). Commands must be hardcoded within the agent's explicit dispatcher function.
+2. **Loopback-Restricted Management API:** The API server (`8081`) binds exclusively to local loopback (`127.0.0.1`). CLI administration requires SSH/local access to the VPS.
+3. **Immutable Node Tracking:** Device IDs are cryptographically generated (128-bit entropy) on first boot and locked to host storage, preventing impersonation.
+4. **Audit Logging:** Every administrative action (`exec`, `tunnel create`, `rename`) generates an entry in the SQLite `audit_logs` table containing target parameters and execution status.
+
+---
+
+## License
+
+Distributed under the MIT License. See `LICENSE` for more information.
