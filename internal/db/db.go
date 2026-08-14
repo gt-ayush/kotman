@@ -35,6 +35,13 @@ func InitDB(filepath string) error {
 		error_msg TEXT,
 		executed_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
+	CREATE TABLE IF NOT EXISTS tunnels (
+		tunnel_id TEXT PRIMARY KEY,
+		device_id TEXT,
+		vps_port INTEGER,
+		local_port INTEGER,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	CREATE TABLE IF NOT EXISTS sequence (
 		name TEXT PRIMARY KEY,
 		val INTEGER
