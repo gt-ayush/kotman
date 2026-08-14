@@ -10,10 +10,13 @@ import (
 
 	"kotman/internal/db"
 	"kotman/protocol"
+	"kotman/internal/tunnel"
 	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+var TunnelManager *tunnel.Manager
 
 // Device holds the active WebSocket connection and pending command requests
 type Device struct {
@@ -48,6 +51,31 @@ func main() {
 		log.Println("Listening for Agents on 0.0.0.0:8080")
 		log.Fatal(http.ListenAndServe(":8080", nil))
 	}()
+
+	TunnelManager = tunnel.NewManager(func(deviceID, streamID string, localPort int) error {
+		mutex.Lock()
+		dev, ok := devices[deviceID]
+		mutex.Unlock()
+
+		if !ok || dev.Status != "ONLINE" {
+			return fmt.Errorf("device offline")
+		}
+
+		return dev.Conn.WriteJSON(protocol.Message{
+			Type:      protocol.MsgTunnelReq,
+			RequestID: streamID,
+			Args:      map[string]string{"local_port": strconv.Itoa(localPort)},
+		})
+	})
+
+	// Auto-start existing tunnels from DB on boot
+	rows, _ := db.DB.Query("SELECT tunnel_id, device_id, vps_port, local_port FROM tunnels")
+	for rows.Next() {
+		var tID, dID string
+		var vp, lp int
+		rows.Scan(&tID, &dID, &vp, &lp)
+		TunnelManager.StartListener(tID, dID, vp, lp)
+	}
 
 	// 2. Local Admin API for the CLI
 	http.HandleFunc("/api/ps", apiPS)
