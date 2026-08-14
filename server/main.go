@@ -83,6 +83,12 @@ func main() {
 	http.HandleFunc("/api/inspect", apiInspect)
 	http.HandleFunc("/api/exec", apiExec)
 	
+	//3. Tunnels CLI
+	http.HandleFunc("/api/tunnel/data", handleTunnelData)
+	http.HandleFunc("/api/tunnel/create", apiTunnelCreate)
+	http.HandleFunc("/api/tunnel/ls", apiTunnelLs)
+	http.HandleFunc("/api/tunnel/rm", apiTunnelRm)
+	
 	log.Println("Listening for CLI on 127.0.0.1:8081")
 	log.Fatal(http.ListenAndServe("127.0.0.1:8081", nil))
 }
@@ -278,14 +284,68 @@ func apiExec(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// --- Handlers ---
+
+// Side-channel WebSocket for data streams
 func handleTunnelData(w http.ResponseWriter, r *http.Request) {
     streamID := r.URL.Query().Get("stream_id")
-    if streamID == "" { return }
-    
+    if streamID == "" {
+        http.Error(w, "missing stream_id", http.StatusBadRequest)
+        return
+    }
+
     conn, err := upgrader.Upgrade(w, r, nil)
-    if err != nil { return }
-    
+    if err != nil {
+        return
+    }
+
     if !TunnelManager.RegisterDataStream(streamID, conn) {
-        conn.Close() // stream_id invalid or expired
+        conn.Close() // invalid or expired stream_id
     }
 }
+
+// Create a new tunnel
+func apiTunnelCreate(w http.ResponseWriter, r *http.Request) {
+    var req struct {
+        DeviceID string `json:"device_id"`
+        VPSPort  int    `json:"vps_port"`
+        LocalPort int   `json:"local_port"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "invalid JSON", http.StatusBadRequest)
+        return
+    }
+
+    tID, err := TunnelManager.Create(req.DeviceID, req.VPSPort, req.LocalPort)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    json.NewEncoder(w).Encode(map[string]string{"tunnel_id": tID})
+}
+
+// List active tunnels
+func apiTunnelLs(w http.ResponseWriter, r *http.Request) {
+    tunnels := TunnelManager.List()
+    json.NewEncoder(w).Encode(tunnels)
+}
+
+// Remove a tunnel
+func apiTunnelRm(w http.ResponseWriter, r *http.Request) {
+    var req struct {
+        TunnelID string `json:"tunnel_id"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "invalid JSON", http.StatusBadRequest)
+        return
+    }
+
+    if err := TunnelManager.Remove(req.TunnelID); err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
