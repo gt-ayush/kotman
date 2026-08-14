@@ -304,48 +304,74 @@ func handleTunnelData(w http.ResponseWriter, r *http.Request) {
     }
 }
 
-// Create a new tunnel
 func apiTunnelCreate(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        DeviceID string `json:"device_id"`
-        VPSPort  int    `json:"vps_port"`
-        LocalPort int   `json:"local_port"`
-    }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        http.Error(w, "invalid JSON", http.StatusBadRequest)
-        return
-    }
+	var req struct {
+		Target    string `json:"target"`
+		VPSPort   int    `json:"vps_port"`
+		LocalPort int    `json:"local_port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-    tID, err := TunnelManager.Create(req.DeviceID, req.VPSPort, req.LocalPort)
-    if err != nil {
-        http.Error(w, err.Error(), http.StatusInternalServerError)
-        return
-    }
+	var deviceID string
+	err := db.DB.QueryRow("SELECT device_id FROM devices WHERE nickname = ?", req.Target).Scan(&deviceID)
+	if err != nil {
+		http.Error(w, "Device not found", http.StatusNotFound)
+		return
+	}
 
-    json.NewEncoder(w).Encode(map[string]string{"tunnel_id": tID})
+	tunnelID := fmt.Sprintf("t-%d", time.Now().Unix())
+
+	_, err = db.DB.Exec("INSERT INTO tunnels (tunnel_id, device_id, vps_port, local_port) VALUES (?, ?, ?, ?)",
+		tunnelID, deviceID, req.VPSPort, req.LocalPort)
+	if err != nil {
+		http.Error(w, "Failed to save tunnel to DB", http.StatusInternalServerError)
+		return
+	}
+
+	if err := TunnelManager.StartListener(tunnelID, deviceID, req.VPSPort, req.LocalPort); err != nil {
+		db.DB.Exec("DELETE FROM tunnels WHERE tunnel_id = ?", tunnelID) // Rollback
+		http.Error(w, "Failed to bind port on VPS: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"tunnel_id": tunnelID, "status": "created"})
 }
 
-// List active tunnels
 func apiTunnelLs(w http.ResponseWriter, r *http.Request) {
-    tunnels := TunnelManager.List()
-    json.NewEncoder(w).Encode(tunnels)
+	rows, err := db.DB.Query(`
+		SELECT t.tunnel_id, d.nickname, t.vps_port, t.local_port 
+		FROM tunnels t 
+		JOIN devices d ON t.device_id = d.device_id
+	`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var tunnels []map[string]any
+	for rows.Next() {
+		var tID, pc string
+		var vp, lp int
+		rows.Scan(&tID, &pc, &vp, &lp)
+		tunnels = append(tunnels, map[string]any{
+			"id": tID, "pc": pc, "vps_port": vp, "local_port": lp,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tunnels)
 }
 
-// Remove a tunnel
 func apiTunnelRm(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        TunnelID string `json:"tunnel_id"`
-    }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        http.Error(w, "invalid JSON", http.StatusBadRequest)
-        return
-    }
+	var req map[string]string
+	json.NewDecoder(r.Body).Decode(&req)
+	tunnelID := req["tunnel_id"]
 
-    if err := TunnelManager.Remove(req.TunnelID); err != nil {
-        http.Error(w, err.Error(), http.StatusInternalServerError)
-        return
-    }
-
-    json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	db.DB.Exec("DELETE FROM tunnels WHERE tunnel_id = ?", tunnelID)
+	TunnelManager.StopListener(tunnelID)
+	w.WriteHeader(http.StatusOK)
 }
-
