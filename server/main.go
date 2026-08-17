@@ -4,27 +4,31 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
-	"strconv"
 
 	"kotman/internal/db"
-	"kotman/protocol"
 	"kotman/internal/tunnel"
+	"kotman/protocol"
+
 	"github.com/gorilla/websocket"
+	"github.com/hashicorp/yamux"
 )
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 var TunnelManager *tunnel.Manager
 
-// Device holds the active WebSocket connection and pending command requests
+// Device now holds the Yamux session and JSON encoder instead of a WebSocket[cite: 1]
 type Device struct {
 	ID       string
 	Status   string
 	LastSeen time.Time
-	Conn     *websocket.Conn
+	Session  *yamux.Session
+	Encoder  *json.Encoder
 
 	PendingMutex sync.Mutex
 	Pending      map[string]chan protocol.Message
@@ -40,18 +44,14 @@ func main() {
 		log.Fatal("DB Init Error:", err)
 	}
 
-	// Reset all devices to OFFLINE on server startup
+	// Reset all devices to OFFLINE on server startup[cite: 1]
 	db.DB.Exec("UPDATE devices SET status = 'OFFLINE'")
 
-	// Start background timeout monitor
+	// Start background timeout monitor[cite: 1]
 	go monitorTimeouts()
 
-	// 1. Public API for PC Agents
-	http.HandleFunc("/ws", handleAgentConnection)
-	go func() {
-		log.Println("Listening for Agents on 0.0.0.0:8080")
-		log.Fatal(http.ListenAndServe(":8080", nil))
-	}()
+	// 1. Phase 6A: Start the dedicated Yamux TCP listener for Agents on port 8082
+	go startAgentTCPServer()
 
 	TunnelManager = tunnel.NewManager(func(deviceID, streamID string, localPort int) error {
 		mutex.Lock()
@@ -62,14 +62,15 @@ func main() {
 			return fmt.Errorf("device offline")
 		}
 
-		return dev.Conn.WriteJSON(protocol.Message{
+		// Write to the Yamux control stream encoder instead of WebSocket[cite: 1]
+		return dev.Encoder.Encode(protocol.Message{
 			Type:      protocol.MsgTunnelReq,
 			RequestID: streamID,
 			Args:      map[string]string{"local_port": strconv.Itoa(localPort)},
 		})
 	})
 
-	// Auto-start existing tunnels from DB on boot
+	// Auto-start existing tunnels from DB on boot[cite: 1]
 	rows, _ := db.DB.Query("SELECT tunnel_id, device_id, vps_port, local_port FROM tunnels")
 	for rows.Next() {
 		var tID, dID string
@@ -78,89 +79,132 @@ func main() {
 		TunnelManager.StartListener(tID, dID, vp, lp)
 	}
 
-	// 2. Local Admin API for the CLI
+	// 2. Local Admin API for the CLI[cite: 1]
 	http.HandleFunc("/api/ps", apiPS)
 	http.HandleFunc("/api/rename", apiRename)
 	http.HandleFunc("/api/inspect", apiInspect)
 	http.HandleFunc("/api/exec", apiExec)
-	
-	//3. Tunnels CLI
+
+	// 3. Tunnels CLI[cite: 1]
 	http.HandleFunc("/api/tunnel/data", handleTunnelData)
 	http.HandleFunc("/api/tunnel/create", apiTunnelCreate)
 	http.HandleFunc("/api/tunnel/ls", apiTunnelLs)
 	http.HandleFunc("/api/tunnel/rm", apiTunnelRm)
-	
-	log.Println("Listening for CLI on 127.0.0.1:8081")
-	log.Fatal(http.ListenAndServe("127.0.0.1:8081", nil))
+
+	log.Println("Listening for CLI and Tunnel Data on 127.0.0.1:8081")
+	log.Fatal(http.ListenAndServe(":8081", nil))
 }
 
-func handleAgentConnection(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+// --- PHASE 6A: YAMUX TCP SERVER ---
+
+func startAgentTCPServer() {
+	listener, err := net.Listen("tcp", ":8082")
 	if err != nil {
+		log.Fatalf("Failed to start agent TCP listener: %v", err)
+	}
+	log.Println("Listening for Agents on 0.0.0.0:8082 (TCP/Yamux)")
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Println("TCP accept error:", err)
+			continue
+		}
+		go handleAgentYamuxConnection(conn)
+	}
+}
+
+func handleAgentYamuxConnection(conn net.Conn) {
+	// 1. Wrap the raw TCP connection with Yamux
+	session, err := yamux.Server(conn, nil)
+	if err != nil {
+		log.Println("Yamux setup error:", err)
+		conn.Close()
 		return
 	}
-	var deviceID string
 
+	// 2. Accept the very first stream from the Agent (Stream 0) for Control
+	controlStream, err := session.Accept()
+	if err != nil {
+		log.Println("Failed to accept control stream:", err)
+		session.Close()
+		return
+	}
+
+	decoder := json.NewDecoder(controlStream)
+	encoder := json.NewEncoder(controlStream)
+
+	var msg protocol.Message
+	if err := decoder.Decode(&msg); err != nil {
+		session.Close()
+		return
+	}
+
+	var deviceID string
+	if msg.Type == protocol.MsgHello {
+		deviceID = msg.DeviceID
+		nickname, _ := db.RegisterOrConnect(deviceID, msg.Version)
+
+		mutex.Lock()
+		devices[deviceID] = &Device{
+			ID:       deviceID,
+			Status:   "ONLINE",
+			LastSeen: time.Now(),
+			Session:  session,
+			Encoder:  encoder,
+			Pending:  make(map[string]chan protocol.Message),
+		}
+		mutex.Unlock()
+
+		log.Printf("Agent Connected via Yamux: %s (%s)", nickname, deviceID)
+		encoder.Encode(protocol.Message{Type: protocol.MsgAuthOK})
+	} else {
+		session.Close()
+		return
+	}
+
+	// Disconnect cleanup
 	defer func() {
 		if deviceID != "" {
 			db.DB.Exec("UPDATE devices SET status = 'OFFLINE' WHERE device_id = ?", deviceID)
-			
-			// Remove from active memory map
+
 			mutex.Lock()
 			delete(devices, deviceID)
 			mutex.Unlock()
 		}
-		conn.Close()
+		session.Close()
 	}()
 
+	// 3. The Control Loop (Replaces the old WebSocket loop)[cite: 1]
 	for {
-		var msg protocol.Message
-		if err := conn.ReadJSON(&msg); err != nil {
+		var m protocol.Message
+		if err := decoder.Decode(&m); err != nil {
 			break
 		}
 
-		switch msg.Type {
-		case protocol.MsgHello:
-			deviceID = msg.DeviceID
-			nickname, _ := db.RegisterOrConnect(deviceID, msg.Version)
-			
-			// Store connection in memory so apiExec can reach it
-			mutex.Lock()
-			devices[deviceID] = &Device{
-				ID:       deviceID,
-				Status:   "ONLINE",
-				LastSeen: time.Now(),
-				Conn:     conn,
-				Pending:  make(map[string]chan protocol.Message),
-			}
-			mutex.Unlock()
-			
-			log.Printf("Agent Connected: %s (%s)", nickname, deviceID)
-			conn.WriteJSON(protocol.Message{Type: protocol.MsgAuthOK})
-
+		switch m.Type {
 		case protocol.MsgHeartbeat:
 			now := time.Now()
 			db.DB.Exec("UPDATE devices SET last_seen = ?, status = 'ONLINE' WHERE device_id = ?", now.Format(time.RFC3339), deviceID)
-			
+
 			mutex.Lock()
 			if dev, ok := devices[deviceID]; ok {
 				dev.LastSeen = now
 			}
 			mutex.Unlock()
-			
-			conn.WriteJSON(protocol.Message{Type: protocol.MsgHeartbeatAck})
-			
+
+			encoder.Encode(protocol.Message{Type: protocol.MsgHeartbeatAck})
+
 		case protocol.MsgExecResult:
-			// Route command results back to the waiting CLI HTTP request
 			mutex.Lock()
 			dev, ok := devices[deviceID]
 			mutex.Unlock()
-			
+
 			if ok {
 				dev.PendingMutex.Lock()
-				if ch, pendingOk := dev.Pending[msg.RequestID]; pendingOk {
-					ch <- msg
-					delete(dev.Pending, msg.RequestID)
+				if ch, pendingOk := dev.Pending[m.RequestID]; pendingOk {
+					ch <- m
+					delete(dev.Pending, m.RequestID)
 				}
 				dev.PendingMutex.Unlock()
 			}
@@ -261,15 +305,15 @@ func apiExec(w http.ResponseWriter, r *http.Request) {
 	dev.Pending[reqID] = respChan
 	dev.PendingMutex.Unlock()
 
-	// Send command down the websocket to the Agent
-	dev.Conn.WriteJSON(protocol.Message{
+	// Send command down the Yamux stream to the Agent
+	dev.Encoder.Encode(protocol.Message{
 		Type:      protocol.MsgExec,
 		RequestID: reqID,
 		Operation: req.Operation,
 		Args:      req.Args,
 	})
 
-	// Wait for Agent response with a 10-second timeout
+	// Wait for Agent response with a 10-second timeout[cite: 1]
 	select {
 	case result := <-respChan:
 		db.LogOperation(deviceID, req.Operation, result.Success, result.Error)
@@ -287,22 +331,22 @@ func apiExec(w http.ResponseWriter, r *http.Request) {
 
 // --- Handlers ---
 
-// Side-channel WebSocket for data streams
+// Side-channel WebSocket for data streams (Kept temporarily until Phase 6B)
 func handleTunnelData(w http.ResponseWriter, r *http.Request) {
-    streamID := r.URL.Query().Get("stream_id")
-    if streamID == "" {
-        http.Error(w, "missing stream_id", http.StatusBadRequest)
-        return
-    }
+	streamID := r.URL.Query().Get("stream_id")
+	if streamID == "" {
+		http.Error(w, "missing stream_id", http.StatusBadRequest)
+		return
+	}
 
-    conn, err := upgrader.Upgrade(w, r, nil)
-    if err != nil {
-        return
-    }
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
 
-    if !TunnelManager.RegisterDataStream(streamID, conn) {
-        conn.Close() // invalid or expired stream_id
-    }
+	if !TunnelManager.RegisterDataStream(streamID, conn) {
+		conn.Close() // invalid or expired stream_id
+	}
 }
 
 func apiTunnelCreate(w http.ResponseWriter, r *http.Request) {
@@ -333,7 +377,7 @@ func apiTunnelCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := TunnelManager.StartListener(tunnelID, deviceID, req.VPSPort, req.LocalPort); err != nil {
-		db.DB.Exec("DELETE FROM tunnels WHERE tunnel_id = ?", tunnelID) // Rollback
+		db.DB.Exec("DELETE FROM tunnels WHERE tunnel_id = ?", tunnelID) // Rollback[cite: 1]
 		http.Error(w, "Failed to bind port on VPS: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
