@@ -3,30 +3,36 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
 	"time"
-	"fmt"
-    "net"
 
+	"kotman/internal/tunnel"
 	"kotman/protocol"
 
 	"github.com/gorilla/websocket"
-	"kotman/internal/tunnel"
+	"github.com/hashicorp/yamux"
 	"github.com/kardianos/service"
 )
 
-// In a real deployment, you'd read this from config.json
-const serverURL = "ws://127.0.0.1:8080/ws"
-const agentVersion = "v0.1.1"
+// Phase 6A: Yamux TCP Listener for control
+const controlAddress = "127.0.0.1:8082" 
+
+// Phase 6A: Temporary WebSocket Side-Channel (until Phase 6B)
+const tunnelDataURL = "ws://127.0.0.1:8081/api/tunnel/data" 
+
+const agentVersion = "v0.1.2" // Bumped version for Phase 6A
 
 var writeMutex sync.Mutex
 
-// program implements service.Interface
+// program implements service.Interface[cite: 2]
 type program struct {
 	exit chan struct{}
 }
@@ -44,13 +50,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Setup logger for the service (writes to Event Viewer on Windows, Syslog on Linux)
+	// Setup logger for the service (writes to Event Viewer on Windows, Syslog on Linux)[cite: 2]
 	logger, err := s.Logger(nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Handle CLI commands (install, uninstall, start, stop)
+	// Handle CLI commands (install, uninstall, start, stop)[cite: 2]
 	if len(os.Args) > 1 {
 		err = service.Control(s, os.Args[1])
 		if err != nil {
@@ -59,7 +65,7 @@ func main() {
 		return
 	}
 
-	// Start the service
+	// Start the service[cite: 2]
 	err = s.Run()
 	if err != nil {
 		logger.Error(err)
@@ -69,15 +75,15 @@ func main() {
 func (p *program) Start(s service.Service) error {
 	p.exit = make(chan struct{})
 	
-	// Start the main agent loop in the background so Start() can return quickly
+	// Start the main agent loop in the background so Start() can return quickly[cite: 2]
 	go p.run()
 	return nil
 }
 
 func (p *program) Stop(s service.Service) error {
-	// Signal the running goroutines to shut down gracefully
+	// Signal the running goroutines to shut down gracefully[cite: 2]
 	close(p.exit)
-	<-time.After(time.Second) // Give it a moment to clean up
+	<-time.After(time.Second) // Give it a moment to clean up[cite: 2]
 	return nil
 }
 
@@ -85,7 +91,7 @@ func (p *program) run() {
 	deviceID := getDeviceID()
 	log.Printf("Starting Kotman Agent with Device ID: %s", deviceID)
 
-	// Reconnect Loop
+	// Reconnect Loop[cite: 2]
 	for {
 		select {
 		case <-p.exit:
@@ -97,7 +103,7 @@ func (p *program) run() {
 		if err != nil {
 			log.Printf("Disconnected: %v. Retrying in 5 seconds...", err)
 			
-			// Wait 5 seconds before retrying, but allow immediate exit if service is stopped
+			// Wait 5 seconds before retrying, but allow immediate exit if service is stopped[cite: 2]
 			select {
 			case <-time.After(5 * time.Second):
 			case <-p.exit:
@@ -108,23 +114,42 @@ func (p *program) run() {
 }
 
 func (p *program) connectToServer(deviceID string) error {
-	log.Printf("Connecting to %s...", serverURL)
-	conn, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
+	log.Printf("Connecting to Yamux control plane at %s...", controlAddress)
+	
+	// 1. Dial Raw TCP
+	conn, err := net.Dial("tcp", controlAddress)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	// If the service is stopped, close the connection immediately to unblock ReadJSON
+	// 2. Wrap in Yamux Client
+	session, err := yamux.Client(conn, nil)
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+
+	// 3. Open Stream 0 for the Control Channel
+	controlStream, err := session.Open()
+	if err != nil {
+		return err
+	}
+	defer controlStream.Close()
+
+	// If the service is stopped, close the session immediately
 	go func() {
 		select {
 		case <-p.exit:
-			conn.Close()
+			session.Close()
 		}
 	}()
 
+	encoder := json.NewEncoder(controlStream)
+	decoder := json.NewDecoder(controlStream)
+
 	// Send HELLO
-	err = sendMsg(conn, protocol.Message{
+	err = sendMsg(encoder, protocol.Message{
 		Type:     protocol.MsgHello,
 		DeviceID: deviceID,
 		Version:  agentVersion,
@@ -133,7 +158,7 @@ func (p *program) connectToServer(deviceID string) error {
 		return err
 	}
 
-	// Start Heartbeat loop
+	// Start Heartbeat loop[cite: 2]
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -141,19 +166,19 @@ func (p *program) connectToServer(deviceID string) error {
 		for {
 			select {
 			case <-ticker.C:
-				sendMsg(conn, protocol.Message{Type: protocol.MsgHeartbeat})
+				sendMsg(encoder, protocol.Message{Type: protocol.MsgHeartbeat})
 			case <-p.exit:
 				return
 			}
 		}
 	}()
 
-	// Main Read Loop
+	// Main Read Loop[cite: 2]
 	for {
 		var msg protocol.Message
-		err := conn.ReadJSON(&msg)
+		err := decoder.Decode(&msg)
 		if err != nil {
-			return err // Network error or connection closed; return triggers reconnect
+			return err // Network error or connection closed; return triggers reconnect[cite: 2]
 		}
 
 		switch msg.Type {
@@ -162,10 +187,10 @@ func (p *program) connectToServer(deviceID string) error {
 		case protocol.MsgExec:
 			go func(req protocol.Message) {
 				res := executeOperation(req)
-				sendMsg(conn, res)
+				sendMsg(encoder, res)
 			}(msg)
 
-		// dispatcher loop for tunnels:
+		// dispatcher loop for tunnels:[cite: 2]
 		case protocol.MsgTunnelReq:
 			go handleTunnelReq(msg)
 		}
@@ -204,13 +229,14 @@ func executeOperation(req protocol.Message) protocol.Message {
 	return res
 }
 
-func sendMsg(conn *websocket.Conn, msg protocol.Message) error {
+// sendMsg now takes a JSON encoder instead of a WebSocket[cite: 2]
+func sendMsg(enc *json.Encoder, msg protocol.Message) error {
 	writeMutex.Lock()
 	defer writeMutex.Unlock()
-	return conn.WriteJSON(msg)
+	return enc.Encode(msg)
 }
 
-// getDeviceID handles Phase 4 Persistent Identity rules
+// getDeviceID handles Phase 4 Persistent Identity rules[cite: 2]
 func getDeviceID() string {
 	var dataDir string
 	if runtime.GOOS == "windows" {
@@ -222,13 +248,13 @@ func getDeviceID() string {
 	os.MkdirAll(dataDir, 0755)
 	idFile := filepath.Join(dataDir, "device-id")
 
-	// Try to read existing ID
+	// Try to read existing ID[cite: 2]
 	b, err := os.ReadFile(idFile)
 	if err == nil && len(b) > 0 {
 		return string(b)
 	}
 
-	// Generate new ID if not found
+	// Generate new ID if not found[cite: 2]
 	newID := make([]byte, 16)
 	rand.Read(newID)
 	idStr := hex.EncodeToString(newID)
@@ -237,30 +263,27 @@ func getDeviceID() string {
 	return idStr
 }
 
-
-
-// Handler function
+// Handler function[cite: 2]
 func handleTunnelReq(req protocol.Message) {
-    streamID := req.RequestID
-    localPort, _ := strconv.Atoi(req.Args["local_port"])
+	streamID := req.RequestID
+	localPort, _ := strconv.Atoi(req.Args["local_port"])
 
-    // 1. Dial Local Service
-    tcp, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
-    if err != nil {
-        log.Printf("TunnelReq[%s]: failed to dial local port %d: %v", streamID, localPort, err)
-        return
-    }
+	// 1. Dial Local Service[cite: 2]
+	tcp, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
+	if err != nil {
+		log.Printf("TunnelReq[%s]: failed to dial local port %d: %v", streamID, localPort, err)
+		return
+	}
 
-    // 2. Dial VPS side-channel
-    // Switch ws:// to wss:// if using TLS in production
-    wsURL := fmt.Sprintf("ws://127.0.0.1:8080/api/tunnel/data?stream_id=%s", streamID)
-    ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-    if err != nil {
-        log.Printf("TunnelReq[%s]: failed to dial VPS side-channel: %v", streamID, err)
-        tcp.Close()
-        return
-    }
+	// 2. Dial VPS side-channel (Still using WebSocket temporarily for Phase 6A)[cite: 2]
+	wsURL := fmt.Sprintf("%s?stream_id=%s", tunnelDataURL, streamID)
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		log.Printf("TunnelReq[%s]: failed to dial VPS side-channel: %v", streamID, err)
+		tcp.Close()
+		return
+	}
 
-    // 3. Link them!
-    go tunnel.Pump(ws, tcp)
+	// 3. Link them![cite: 2]
+	go tunnel.Pump(ws, tcp)
 }
